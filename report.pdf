@@ -1,0 +1,239 @@
+            Experiment Report: Basic Static Routing and ARP Handling
+            Name:He Yixuan    ID:231840268     Department:Mathematics
+            Teacher:Huang Chengyuan         Tutor:Liu Songyue       
+1.Objective
+The primary goal of this experiment is to implement basic static routing functionality, including constructing a forwarding table, handling packet forwarding, and managing ARP requests. The specific tasks include:
+
+Constructing a forwarding table from configuration files and interface information.
+Forwarding packets by matching their destination addresses with the forwarding table.
+Sending ARP requests and handling ARP replies to obtain the necessary MAC addresses for packet forwarding.
+2.Implementation
+2.1 Constructing the Forwarding Table
+The forwarding table is constructed from two sources:
+
+The router's interfaces, obtained using net.interfaces().
+A configuration file named forwarding_table.txt.
+Each entry in the forwarding table contains:
+
+Network prefix (e.g., 149.43.0.0)
+Subnet mask (e.g., 255.255.0.0)
+Next-hop IP address (if the destination network is not directly connected)
+Interface to which the packet should be forwarded
+Example entries from forwarding_table.txt:
+172.16.0.0 255.255.255.0 192.168.1.2 router-eth0
+192.168.200.0 255.255.255.0 192.168.200.1 router-eth1
+For each interface, the router adds an entry to the forwarding table for the directly connected network:
+Network Address   Subnet Mask       Next Hop Address   Interface
+192.168.1.0      255.255.255.0     0.0.0.0            router-eth0
+172.16.1.0       255.255.255.0     0.0.0.0            router-eth1
+2. Matching Destination IP Addresses
+After constructing the forwarding table, the router matches the destination IP address of received packets with the table entries using the longest prefix match rule. Special cases are handled as follows:
+
+If the Ethernet destination is neither a broadcast address nor the MAC address of the incoming port, the packet is discarded.
+If no matching entry is found in the table, the packet is temporarily discarded.
+If the packet is destined for the router itself, it is discarded.
+3. Forwarding Packets and Handling ARP Requests
+Once the destination IP address is matched, the router:
+
+Decreases the TTL field in the IP header by 1.
+Creates a new Ethernet header, requiring the target MAC address to be known.
+Sends an ARP request to resolve the target MAC address if it is not in the ARP cache.
+Retries the ARP request up to 5 times if no response is received within 1 second.
+Forwards the packet once the target MAC address is resolved.
+Code Implementation
+The implementation is done in a Python script named myrouter.py. Key methods and classes include:
+
+RoutingTableEntry: Represents an entry in the forwarding table.
+ARPQueueItem: Represents a packet waiting for an ARP response.
+Router: The main class that handles packet reception, forwarding, and ARP requests.
+#!/usr/bin/env python3
+
+import time
+import switchyard
+from switchyard.lib.userlib import *
+from switchyard.lib.address import *
+import ipaddress
+from collections import deque
+
+class RoutingTableEntry:
+    def __init__(self, network, mask, next_hop, interface):
+        self.network = ipaddress.IPv4Network(f"{network}/{mask}", strict=False)
+        self.next_hop = next_hop
+        self.interface = interface
+
+class ARPQueueItem:
+    def __init__(self, packet, interface, next_hop_ip, retries=0, last_sent_time=None):
+        self.packet = packet
+        self.interface = interface
+        self.next_hop_ip = next_hop_ip
+        self.retries = retries
+        self.last_sent_time = last_sent_time if last_sent_time else time.time()
+
+class Router(object):
+    def __init__(self, net: switchyard.llnetbase.LLNetBase):
+        self.net = net
+        self.routing_table = []
+        self.load_routing_table()
+        self.interfaces = self.net.interfaces()
+        self.interface_info = {
+            iface.name: {
+                'ip': iface.ipaddr,
+                'hw': iface.ethaddr
+            } for iface in self.interfaces
+        }
+        self.arp_cache = {}
+        self.arp_queue = deque()
+
+    def load_routing_table(self):
+        with open("forwarding_table.txt", "r") as f:
+            for line in f:
+                network, mask, next_hop, interface = line.strip().split()
+                self.routing_table.append(RoutingTableEntry(network, mask, next_hop, interface))
+        
+        # Add directly connected networks
+        for iface in self.net.interfaces():
+            self.routing_table.append(RoutingTableEntry(
+                str(iface.netmask), 
+                str(iface.netmask), 
+                "0.0.0.0", 
+                iface.name
+            ))
+
+    def find_best_match(self, dest_ip):
+        best_match = None
+        longest_prefix = -1
+        dest_ip_addr = ipaddress.IPv4Address(dest_ip)
+        
+        for entry in self.routing_table:
+            if dest_ip_addr in entry.network:
+                if entry.network.prefixlen > longest_prefix:
+                    longest_prefix = entry.network.prefixlen
+                    best_match = entry
+        
+        return best_match
+
+    def handle_packet(self, recv: switchyard.llnetbase.ReceivedPacket):
+        timestamp, iface_name, packet = recv
+        eth_hdr = packet.get_header(Ethernet)
+        ip_hdr = packet.get_header(IPv4)
+        
+        if eth_hdr is None or ip_hdr is None:
+            log_debug("Received a non-IP packet")
+            return
+        
+        if eth_hdr.dst != "ff:ff:ff:ff:ff:ff" and eth_hdr.dst != self.interface_info[iface_name]['hw']:
+            log_debug("Ignored packet not destined for this router's MAC address")
+            return
+        
+        if ip_hdr.dst in [iface['ip'] for iface in self.interface_info.values()]:
+            log_debug("Packet destined for this router, ignored")
+            return
+        
+        match_entry = self.find_best_match(ip_hdr.dst)
+        if match_entry is None:
+            log_debug("No matching route found, packet dropped")
+            return
+        
+        ip_hdr.ttl -= 1
+        if ip_hdr.ttl <= 0:
+            log_debug("TTL expired, packet dropped")
+            return
+        
+        if match_entry.next_hop == "0.0.0.0":
+            next_hop_ip = ip_hdr.dst
+        else:
+            next_hop_ip = match_entry.next_hop
+        
+        if next_hop_ip in self.arp_cache:
+            self.forward_packet(packet, match_entry, next_hop_ip)
+        else:
+            self.send_arp_request(packet, match_entry, next_hop_ip)
+
+    def forward_packet(self, packet, match_entry, next_hop_ip):
+        next_hop_mac = self.arp_cache[next_hop_ip]
+        next_hop_interface = self.net.interface_by_name(match_entry.interface)
+        
+        new_eth_hdr = Ethernet()
+        new_eth_hdr.src = self.interface_info[match_entry.interface]['hw']
+        new_eth_hdr.dst = next_hop_mac
+        new_eth_hdr.ethertype = EtherType.IPv4
+        
+        new_packet = new_eth_hdr + packet[1:]
+        self.net.send_packet(match_entry.interface, new_packet)
+
+    def send_arp_request(self, packet, match_entry, next_hop_ip):
+        next_hop_interface = self.net.interface_by_name(match_entry.interface)
+        arp_request = create_ip_arp_request(
+            senderhwaddr=self.interface_info[match_entry.interface]['hw'],
+            senderprotoaddr=self.interface_info[match_entry.interface]['ip'],
+            targetprotoaddr=next_hop_ip
+        )
+        self.net.send_packet(match_entry.interface, arp_request)
+        self.arp_queue.append(ARPQueueItem(packet, match_entry, next_hop_ip))
+
+    def process_arp_queue(self):
+        now = time.time()
+        to_remove = []
+        
+        for item in self.arp_queue:
+            if now - item.last_sent_time >= 1:
+                if item.retries < 5:
+                    self.send_arp_request(item.packet, item.match_entry, item.next_hop_ip)
+                    item.retries += 1
+                    item.last_sent_time = now
+                else:
+                    to_remove.append(item)
+        
+        for item in to_remove:
+            self.arp_queue.remove(item)
+
+    def handle_arp_reply(self, arp_reply):
+        sender_ip = arp_reply.senderprotoaddr
+        sender_mac = arp_reply.senderhwaddr
+        self.arp_cache[sender_ip] = sender_mac
+        
+        to_remove = []
+        for item in self.arp_queue:
+            if item.next_hop_ip == sender_ip:
+                self.forward_packet(item.packet, item.match_entry, sender_ip)
+                to_remove.append(item)
+        
+        for item in to_remove:
+            self.arp_queue.remove(item)
+
+    def start(self):
+        while True:
+            try:
+                recv = self.net.recv_packet(timeout=1.0)
+                self.handle_packet(recv)
+            except NoPackets:
+                pass
+            except Shutdown:
+                break
+            
+            self.process_arp_queue()
+        
+        self.stop()
+
+    def stop(self):
+        self.net.shutdown()
+
+def main(net):
+    router = Router(net)
+    router.start()
+    3.Testing
+3.1 Switchyard Testing
+To test the router, we used the following commands:
+$ swyard -t testcases/testscenario2.srpy myrouter.py
+$ swyard -t testcases/testscenario2_advanced.srpy myrouter.py
+3.22. Mininet Testing
+We tested the router in a Mininet environment with the topology defined in start_mininet.py. The steps followed were:
+
+Start Mininet:
+$ sudo python start_mininet.py
+Open an xterm on the router node and start the router:
+router# swyard myrouter.py
+Open xterms on other nodes (e.g., client and server1) and perform ping tests:
+client# ping -c2 192.168.100.1
+We observed the packet forwarding and ARP resolution processes using Wireshark on the router's interface router-eth2:
+router# wireshark -i router-eth2
