@@ -1,0 +1,83 @@
+       南京大学本科生实验报告
+课程名称：计算机网络	教师：黄程远	助教：刘松岳
+姓名：何易轩	院系：数学学院	学号：231840268
+一、	实验名称
+        Forwarding packets
+二、	实验目的
+        在本实验中，我尝试在上一个实验的基础上，构建路由器的核心功能，即配置路由表并根据路由表进行路由转发。
+    其中涉及到发送ARP寻址报文，并根据ARP回复报文进行转发行为。
+三、	实验内容
+    3.1构建路由表
+            在这个实验中，我们实现的是一个静态路由器，即：这个路由器的路由表是通过读取文件forwarding_table.txt以及调用自身接口信息获得的。
+        我们的路由表的每一个表项由四个部分构成，它们分别是：子网前缀、子网掩码、下一跳IP地址以及端口名称。
+        在具体实现上，我构建了一个“RoutingEntry”对象，用以表示每一个表项，再建立一个列表作为路由转发表。在Router类的构造函数中，
+        我对路由表进行了配置，具体代码如下：
+            for intf in self.interfaces:
+                network = ipaddress.ip_network(f"{intf.ipaddr}/{intf.netmask}", strict=False)
+                entry = RoutingEntry(network.network_address, network.netmask, None, intf.name)
+                self.routingtable.append(entry)
+
+
+            try:
+                with open("forwarding_table.txt") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        fields = line.split()
+                        prefix = ipaddress.IPv4Address(fields[0])
+                        mask = ipaddress.IPv4Address(fields[1])
+                        next_hop = ipaddress.IPv4Address(fields[2]) if fields[2] != '-' else None
+                        interface_name = fields[3]
+                        entry = RoutingEntry(prefix, mask, next_hop, interface_name)
+                        self.routingtable.append(entry)
+            except Exception as e:
+                log_info(f"Error loading forwarding table: {e}")
+	3.2找到匹配表项
+		    当一个数据包到达时，我们提取它的包头，并找到与之匹配的路由表表项，当有多个表项与之匹配时，应遵循最长前缀匹配原则。
+        这部分代码参考了实验手册中提供的方法，具体内容如下：
+            def find_best_route(self, dst_ip):
+                longest_prefix = -1
+                best_match = None
+
+            for entry in self.routingtable:
+                if int(dst_ip) & int(entry.mask) == int(entry.prefix):
+                    netaddr = ipaddress.ip_network(f"{entry.prefix}/{entry.mask}")
+                    if netaddr.prefixlen > longest_prefix:
+                        longest_prefix = netaddr.prefixlen
+                        best_match = entry
+
+            return best_match
+	3.3进行ARP寻址
+		    当数据包的目的IP在路由表中找不到对应的MAC地址时，我们需要进行ARP寻址。为此我们构建一个列表，用以存储尚未找到MAC地址的数据包。
+        当有ARP回复报文到达时，我们用相关的信息构建一个包头，将相应的数据包转发出去并从列表中移除；当ARP请求超过1秒未得回复时则重发；当5次ARP寻址均告失败时，
+        则放弃寻址。相关代码如下：
+        packet_queue = []
+        while True:
+           
+            if packet_queue:
+                queued_packet = packet_queue[0]
+                port = next((intf for intf in self.interfaces if intf.name == queued_packet.best_match_entry.interface_name), None)
+                target_ip = queued_packet.best_match_entry.next_hop or queued_packet.packet[IPv4].dst
+
+                if target_ip in self.cachetable:
+                    queued_packet.packet[Ethernet].dst = self.cachetable[target_ip]
+                    queued_packet.packet[Ethernet].src = port.ethaddr
+                    self.net.send_packet(port, queued_packet.packet)
+                    del packet_queue[0]
+                elif queued_packet.attempt_count >= 5:
+                    del packet_queue[0]
+                else:
+                    cur_time = time.time()
+                    if queued_packet.attempt_count == 0 or (cur_time - queued_packet.attempt_time) > 1:
+                        ether = Ethernet(src=port.ethaddr, dst='ff:ff:ff:ff:ff:ff', ethertype=EtherType.ARP)
+                        arp = Arp(operation=ArpOperation.Request,
+                                  senderhwaddr=port.ethaddr,
+                                  senderprotoaddr=port.ipaddr,
+                                  targethwaddr='ff:ff:ff:ff:ff:ff',
+                                  targetprotoaddr=target_ip)
+                        arp_request = ether + arp
+                        self.net.send_packet(port, arp_request)
+                        queued_packet.attempt_count += 1
+                        queued_packet.attempt_time = cur_time
+四、	实验结果
+    在这个实验中，我通过了testcases/testscenario2.srpy测试，初步实现了路由器的基本功能。
